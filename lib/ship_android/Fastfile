@@ -1,0 +1,297 @@
+# The shared `testers` and `production` lanes, loaded by each app's fastlane/Fastfile with
+# `import ShipAndroid::FASTFILE` after ShipAndroid.configure. Everything app-specific comes from
+# ShipAndroid.config; every decision lives in decisions.rb / ci_gate.rb, which are unit-tested.
+# Spec: 2026-10-05-shared-ship-pipeline-design.md (Driftwell repo).
+require "fileutils"
+require "json"
+require "open3"
+require "tmpdir"
+require "ship_android"
+
+default_platform(:android)
+
+SHIP_JBR = "C:/Program Files/Android/Android Studio/jbr"
+
+def ship_cfg
+  ShipAndroid.config
+end
+
+# stdout only: git output here is data (status, notes, SHAs), so stderr never mixes in.
+def git(*args)
+  out, err, status = Open3.capture3("git", "-C", ship_cfg.root, *args)
+  [out.strip, status.success?, err.strip]
+end
+
+def git!(*args)
+  out, ok, err = git(*args)
+  UI.user_error!("git #{args.join(' ')} failed: #{err}") unless ok
+  out
+end
+
+def gh(*args)
+  out, err, status = Open3.capture3("gh", *args, chdir: ship_cfg.root)
+  [out.strip, status.success?, err.strip]
+rescue Errno::ENOENT
+  ["", false, "gh is not installed"]
+end
+
+def gradlew(*args)
+  # Absolute path: Ruby's spawn only searches PATH for a bare program name, not cwd. No nested
+  # Dir.chdir either - fastlane already runs lanes from inside fastlane/ and warns on one - so
+  # --project-dir points Gradle at the root explicitly.
+  root = ship_cfg.root
+  wrapper = File.join(root, Gem.win_platform? ? "gradlew.bat" : "gradlew")
+  sh(wrapper, "--project-dir", root, *args, "--console=plain")
+end
+
+def play_json_key
+  props = ShipAndroid::Decisions.read_properties(File.join(ship_cfg.root, "local.properties"))
+  key = props["PLAY_SERVICE_ACCOUNT_JSON"].to_s
+  return key if !key.empty? && File.exist?(key)
+
+  UI.user_error!("PLAY_SERVICE_ACCOUNT_JSON in local.properties must point at the service-account key " \
+                 "(write Windows paths with forward slashes, e.g. C:/keys/sa.json - a single backslash " \
+                 "is an escape in that file) - see #{ship_cfg.setup_doc}")
+end
+
+# After Play has accepted the upload the ship has succeeded, so tagging never raises: a failure
+# is reported in the summary instead, and nobody reruns (and re-uploads) for it. The push runs
+# with prompts off - an invisible credential prompt would hang the lane.
+def tag_commit(tag, sha, message)
+  _, ok, err = git("tag", "-a", tag, "-m", message, sha)
+  return [false, "#{tag} NOT created: #{err}"] unless ok
+
+  push_env = { "GIT_TERMINAL_PROMPT" => "0", "GCM_INTERACTIVE" => "never" }
+  _, err, status = Open3.capture3(push_env, "git", "-C", ship_cfg.root, "push", "origin", tag)
+  return [false, "#{tag} created locally, PUSH FAILED: #{err.strip.lines.last.to_s.strip}"] unless status.success?
+
+  [true, tag]
+rescue StandardError => e
+  [false, "#{tag} NOT pushed: #{e.message}"]
+end
+
+before_all do
+  # The machine-wide JDK is rejected by AGP; Android Studio's bundled JDK builds both apps.
+  ENV["JAVA_HOME"] = SHIP_JBR if ENV["JAVA_HOME"].to_s.empty? && File.directory?(SHIP_JBR)
+end
+
+# Returns HEAD's full SHA. With sha:, also insists HEAD is still that commit - checked again right
+# before each build, so the bundle, the notes and the tag all describe one commit.
+private_lane :ensure_clean do |options|
+  dirty = git!("status", "--porcelain")
+  UI.user_error!("Working tree is not clean - commit or stash first:\n#{dirty}") unless dirty.empty?
+  head = git!("rev-parse", "HEAD")
+  if options[:sha] && head != options[:sha]
+    UI.user_error!("HEAD moved from #{options[:sha][0, 9]} to #{head[0, 9]} while the lane ran - " \
+                   "every upload must be one commit; rerun once the repo is settled")
+  end
+  head
+end
+
+# The order of operations is merge, CI green, then ship. sha must be the default branch's tip
+# (testers) or on the default branch (production, ancestor: true), with every check passed.
+private_lane :merged_and_green do |options|
+  sha = options[:sha]
+  _, ok, err = gh("auth", "status")
+  UI.user_error!("gh is not signed in (#{err.lines.first.to_s.strip}) - run `gh auth login`, then rerun") unless ok
+
+  repo_json, ok, err = gh("repo", "view", "--json", "nameWithOwner,defaultBranchRef")
+  UI.user_error!("gh repo view failed - is origin a GitHub repo? #{err}") unless ok
+  repo = JSON.parse(repo_json)
+  slug = repo.fetch("nameWithOwner")
+  branch = repo.dig("defaultBranchRef", "name")
+
+  git!("fetch", "--quiet", "origin", branch)
+  tip = git!("rev-parse", "origin/#{branch}")
+  problem =
+    if options[:ancestor]
+      _, on_branch, = git("merge-base", "--is-ancestor", sha, tip)
+      on_branch ? nil : "#{sha[0, 9]} is not on origin/#{branch} - only merged builds go to production"
+    else
+      ShipAndroid::CiGate.branch_problem(head: sha, tip: tip, branch: branch,
+                                         current_branch: git!("rev-parse", "--abbrev-ref", "HEAD"))
+    end
+  UI.user_error!(problem) if problem
+
+  out, ok, err = gh("api", "--paginate", "repos/#{slug}/commits/#{sha}/check-runs", "--jq", ".check_runs[]")
+  UI.user_error!("Could not read CI checks for #{sha[0, 9]}: #{err}") unless ok
+  runs = out.lines.map(&:strip).reject(&:empty?).map { |l| JSON.parse(l) }
+  problem = ShipAndroid::CiGate.ci_problem(runs)
+  UI.user_error!(problem) if problem
+
+  UI.success("Merged and green: #{sha[0, 9]} on #{branch}, #{ShipAndroid::CiGate.latest_runs(runs).size} check(s) passed")
+end
+
+private_lane :notes_for do |options|
+  # No tag yet is expected (describe fails): fall back to the last 10 commits.
+  last_tag, found = git("describe", "--tags", "--abbrev=0", "--match", "testers/android/v*", options[:sha])
+  range = found ? ["#{last_tag}..#{options[:sha]}"] : ["-n", "10", options[:sha]]
+  log = git!("log", "--format=%s", *range)
+  ShipAndroid::Decisions.release_notes(subjects: log.lines, override: options[:override])
+end
+
+platform :android do
+  lane :testers do |options|
+    cfg = ship_cfg
+    root = cfg.root
+    diagnostics_supported = !cfg.diagnostics_property.nil?
+    # First: a mistyped option (dry-run:true, dry_run:1) must never mean a real upload.
+    begin
+      opts = ShipAndroid::Decisions.lane_options(options, diagnostics_supported: diagnostics_supported)
+    rescue ArgumentError => e
+      UI.user_error!(e.message)
+    end
+    dry_run = opts[:dry_run]
+
+    sha = ensure_clean
+    if opts[:allow_unmerged]
+      UI.important("allow_unmerged:true - the merged-and-green gate is SKIPPED; production will refuse this build")
+    else
+      merged_and_green(sha: sha)
+    end
+
+    if cfg.preflight && (problem = cfg.preflight.call(root))
+      UI.user_error!(problem)
+    end
+
+    signing = ShipAndroid::Decisions.read_properties(File.join(root, cfg.signing_file))
+    problems = ShipAndroid::Decisions.signing_problems(signing, cfg.signing_keys, File.join(root, cfg.store_file_base))
+    UI.user_error!("Release signing not configured in #{cfg.signing_file}: #{problems.join(', ')}") unless problems.empty?
+    json_key = play_json_key
+
+    if opts[:skip_tests]
+      UI.important("skip_tests:true - unit tests NOT run for this upload")
+    else
+      gradlew(*cfg.test_tasks)
+    end
+
+    play_codes = ShipAndroid::Decisions::TRACKS.flat_map do |track|
+      google_play_track_version_codes(track: track, json_key: json_key, package_name: cfg.package)
+    end
+    floor = ShipAndroid::Decisions.version_code_floor(File.read(File.join(root, "app/build.gradle.kts")))
+    code = ShipAndroid::Decisions.next_version_code(play_codes: play_codes, floor: floor)
+
+    notes = notes_for(override: opts[:notes], sha: sha)
+    commit = git!("rev-parse", "--short", sha)
+    # Stamped here, not by Gradle on every build: a per-build timestamp would defeat Gradle's
+    # caching. An app that does not read -PbuildDate simply ignores it.
+    build_date = Time.now.strftime("%Y-%m-%d")
+    upload_dir = File.join(root, "app/build/outputs/upload")
+
+    Dir.mktmpdir("ship-testers") do |metadata|
+      FileUtils.mkdir_p(File.join(metadata, "en-US/changelogs"))
+      File.write(File.join(metadata, "en-US/changelogs/default.txt"), notes)
+
+      upload = lambda do |version_code|
+        ensure_clean(sha: sha)
+        args = ["bundleRelease", "-PversionCode=#{version_code}", "-PbuildDate=#{build_date}"]
+        # diagnostics:false builds a production candidate, which `production` later promotes
+        # byte-for-byte, so it must not carry tester tools.
+        args << "-P#{cfg.diagnostics_property}=#{opts[:diagnostics]}" if diagnostics_supported
+        gradlew(*args)
+        begin
+          aab = ShipAndroid::Decisions.stamped_bundle(Dir.glob(File.join(upload_dir, "*.aab")), version_code)
+        rescue RuntimeError => e
+          UI.user_error!(e.message)
+        end
+        upload_to_play_store(
+          package_name: cfg.package,
+          json_key: json_key,
+          track: "internal",
+          release_status: "completed",
+          aab: aab,
+          metadata_path: metadata,
+          skip_upload_apk: true,
+          skip_upload_metadata: true,
+          skip_upload_images: true,
+          skip_upload_screenshots: true,
+          skip_upload_changelogs: false,
+          validate_only: dry_run,
+        )
+      end
+
+      begin
+        upload.call(code)
+      rescue StandardError => e
+        raise unless ShipAndroid::Decisions.version_code_reused?(e.message)
+
+        UI.important("Play says #{code} is burned; retrying once with #{code + 1}. Raise the floor in app/build.gradle.kts.")
+        code += 1
+        upload.call(code)
+      end
+    end
+
+    tag_message = ShipAndroid::Decisions.tag_message(diagnostics: diagnostics_supported ? opts[:diagnostics] : nil,
+                                                     unmerged: opts[:allow_unmerged])
+    name = ShipAndroid::Decisions.tag_name(:android, code)
+    tagged, tag = dry_run ? [true, "(dry run - not tagged)"] : tag_commit(name, sha, tag_message)
+
+    UI.success(dry_run ? "Validated (dry run, nothing published)" : "Shipped to internal testers")
+    UI.important("UNMERGED BUILD - shipped with allow_unmerged:true; production will refuse it") if opts[:allow_unmerged]
+    UI.message("versionCode: #{code}")
+    UI.message("commit:      #{commit}")
+    UI.message("built:       #{build_date}")
+    UI.message("tag:         #{tag}")
+    diag_line =
+      if !diagnostics_supported then "none (this app has no diagnostics build)"
+      elsif opts[:diagnostics] then "ON - tester build, do NOT promote to Production"
+      else "OFF - production candidate: smoke-test, then `fastlane android production version_code:#{code}`"
+      end
+    UI.message("diagnostics: #{diag_line}")
+    UI.message("notes:\n#{notes}")
+    unless tagged
+      UI.important("The build IS live for internal testers - do NOT rerun the lane (that would upload again). " \
+                   "Only the tag is missing; add it by hand from the repo root: " \
+                   "git tag -a #{name} -m '#{tag_message.tr("\n", ' ')}' #{sha} (skip if it exists), then git push origin #{name}")
+    end
+  end
+
+  # Promotes a build internal testers already have to Production, byte-for-byte - no rebuild, no
+  # upload. Release notes travel with the release from internal.
+  lane :production do |options|
+    cfg = ship_cfg
+    begin
+      opts = ShipAndroid::Decisions.promote_options(options)
+    rescue ArgumentError => e
+      UI.user_error!(e.message)
+    end
+    code = opts[:version_code]
+    json_key = play_json_key
+
+    tag = ShipAndroid::Decisions.tag_name(:android, code)
+    git("fetch", "--quiet", "origin", "refs/tags/#{tag}:refs/tags/#{tag}")
+    _, tag_found, = git("rev-parse", "--verify", "--quiet", "refs/tags/#{tag}")
+    tag_message = tag_found ? git("tag", "-l", "--format=%(contents)", tag).first : ""
+    internal_codes = google_play_track_version_codes(track: "internal", json_key: json_key, package_name: cfg.package)
+
+    problem = ShipAndroid::Decisions.promotion_problem(
+      code: code, internal_codes: internal_codes, tag_found: tag_found, tag_message: tag_message,
+      trust_untagged: opts[:trust_untagged], diagnostics_supported: !cfg.diagnostics_property.nil?,
+    )
+    UI.user_error!(problem) if problem
+    merged_and_green(sha: git!("rev-list", "-n", "1", tag), ancestor: true)
+
+    upload_to_play_store(
+      package_name: cfg.package,
+      json_key: json_key,
+      track: "internal",
+      track_promote_to: "production",
+      version_code: code,
+      track_promote_release_status: opts[:rollout] ? "inProgress" : "completed",
+      rollout: opts[:rollout]&.to_s,
+      skip_upload_apk: true,
+      skip_upload_aab: true,
+      skip_upload_metadata: true,
+      skip_upload_changelogs: true,
+      skip_upload_images: true,
+      skip_upload_screenshots: true,
+      validate_only: opts[:dry_run],
+    )
+
+    UI.success(opts[:dry_run] ? "Validated (dry run, nothing promoted)" : "Promoted to Production and sent for review")
+    UI.message("versionCode: #{code}")
+    UI.message("tag:         #{tag}")
+    UI.message("rollout:     #{opts[:rollout] ? "#{(opts[:rollout] * 100).round}% staged" : 'full'}")
+    UI.important("If managed publishing is off, it goes live by itself once Google approves it.") unless opts[:dry_run]
+  end
+end
