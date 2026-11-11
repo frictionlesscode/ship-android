@@ -83,3 +83,7 @@ with `dry_run:true` in an app, which runs every gate and has Play validate witho
 2. Add the `Gemfile` line and the `stampReleaseBundle` task. Copy it from RuckPace's
    `app/build.gradle.kts`.
 3. Give the repo CI on a self-hosted runner and protect its default branch, requiring its checks.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
