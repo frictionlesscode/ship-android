@@ -2,5 +2,6 @@
   "name": "ship-android",
   "description": "Ship frictionlesscode's Android apps to Google Play: /ship-testers and /ship-production over the shared ship_android fastlane lanes, gated on merged-and-green CI.",
   "version": "1.0.0",
-  "author": { "name": "Michael Swanson", "url": "https://frictionlesscode.com" }
+  "author": { "name": "Michael Swanson", "url": "https://frictionlesscode.com" },
+  "license": "MIT"
 }
